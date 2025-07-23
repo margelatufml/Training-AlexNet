@@ -24,7 +24,6 @@ test_df = pd.read_csv("test.csv")
 
 MODEL_NAME = "microsoft/deberta-v3-large"
 MAX_LEN = 512
-BATCH_SIZE = 64    # Go big! Try 256/192/128, tune as needed for your VRAM
 NUM_WORKERS = 16    # Use a high number for best data pipeline
 NUM_FOLDS = 6
 EPOCHS = 4
@@ -84,8 +83,8 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, train_df['label'
     training_args = TrainingArguments(
         output_dir=f"./deberta_results_fold{fold}",
         num_train_epochs=EPOCHS,
-        per_device_train_batch_size=BATCH_SIZE,
-        per_device_eval_batch_size=BATCH_SIZE * 2,
+        per_device_train_batch_size=32,
+        per_device_eval_batch_size=32,
         gradient_accumulation_steps=1,
         learning_rate=1e-5,
         weight_decay=0.01,
