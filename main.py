@@ -75,7 +75,7 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, train_df['label'
     val_enc = tokenize_texts(val_data['text'], val_data['label'])
     train_dataset = TextDataset(train_enc)
     val_dataset = TextDataset(val_enc)
-    model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=3)
+    model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=3, trust_remote_code=True)
 
     # bfloat16 is even faster/better than fp16 on Ada, Hopper, A100, H100, L40S, RTX 6000 Ada, etc.
     bf16_flag = torch.cuda.is_bf16_supported() if cuda else False
