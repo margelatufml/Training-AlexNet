@@ -24,7 +24,7 @@ test_df = pd.read_csv("test.csv")
 
 MODEL_NAME = "microsoft/deberta-v3-large"
 MAX_LEN = 512
-BATCH_SIZE = 128    # Go big! Try 256/192/128, tune as needed for your VRAM
+BATCH_SIZE = 64    # Go big! Try 256/192/128, tune as needed for your VRAM
 NUM_WORKERS = 16    # Use a high number for best data pipeline
 NUM_FOLDS = 6
 EPOCHS = 4
