@@ -29,7 +29,8 @@ NUM_WORKERS = 16    # Use a high number for best data pipeline
 NUM_FOLDS = 6
 EPOCHS = 4
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=False)
+
 
 def tokenize_texts(texts, labels=None):
     encodings = tokenizer(
