@@ -1,46 +1,37 @@
 import os
-import torch
 import pandas as pd
 import numpy as np
-from transformers import (
-    AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments,
-    DataCollatorWithPadding, EarlyStoppingCallback
-)
+from transformers import (AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments,
+                          DataCollatorWithPadding, EarlyStoppingCallback)
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import log_loss
+import torch
 
-# ---- 1. Environment and Logging ----
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-CACHE_DIR = "./huggingface_cache"
-os.environ["HF_HOME"] = CACHE_DIR
-os.environ["TRANSFORMERS_CACHE"] = CACHE_DIR
-os.environ["HF_DATASETS_CACHE"] = CACHE_DIR
-os.makedirs(CACHE_DIR, exist_ok=True)
+# HuggingFace cache
+os.environ['HF_HOME'] = '/workspace/huggingface_cache'
+os.environ['TRANSFORMERS_CACHE'] = '/workspace/huggingface_cache'
+os.environ['HF_DATASETS_CACHE'] = '/workspace/huggingface_cache'
+os.makedirs('/workspace/huggingface_cache', exist_ok=True)
 
-print("CUDA available:", torch.cuda.is_available())
-if torch.cuda.is_available():
-    print("GPU:", torch.cuda.get_device_name(0))
-
-# ---- 2. Data ----
+# 1. Data
 train = pd.read_csv('train.csv')
 test = pd.read_csv('test.csv')
 author2label = {a: i for i, a in enumerate(sorted(train['author'].unique()))}
 label2author = {i: a for a, i in author2label.items()}
 train['label'] = train['author'].map(author2label)
-print(f"Loaded data: train shape = {train.shape}, test shape = {test.shape}")
 
-# ---- 3. Model & Tokenizer ----
-MODEL_NAME = "roberta-large"  # Change to another model if you want
-MAX_LEN = 384  # Increase to 512 if memory allows
+MODEL_NAME = "albert-xxlarge-v2"
+MAX_LEN = 512  # reduce to 384 if OOM
+
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
 def preprocess(tokenizer, df):
     return tokenizer(
         df["text"].tolist(),
         truncation=True,
-        padding=False,  # Dynamic padding
+        padding=False,       # dynamic padding
         max_length=MAX_LEN,
-        return_tensors=None
+        return_tensors=None  # tensors in collator
     )
 
 class SpookyDataset(torch.utils.data.Dataset):
@@ -60,9 +51,10 @@ def compute_metrics(eval_pred):
     probs = torch.nn.functional.softmax(torch.tensor(logits), dim=-1).numpy()
     return {"log_loss": log_loss(labels, probs)}
 
+# 2. Data Collator (fast dynamic padding)
 data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=8)
 
-# ---- 4. Cross-validation ----
+# 3. KFold
 NUM_FOLDS = 5
 skf = StratifiedKFold(n_splits=NUM_FOLDS, shuffle=True, random_state=42)
 oof_preds = np.zeros((len(train), 3))
@@ -75,6 +67,7 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train, train['label'])):
 
     train_encodings = preprocess(tokenizer, train_fold)
     val_encodings = preprocess(tokenizer, val_fold)
+
     train_dataset = SpookyDataset(train_encodings, train_fold['label'].values)
     val_dataset = SpookyDataset(val_encodings, val_fold['label'].values)
 
@@ -86,44 +79,39 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train, train['label'])):
     training_args = TrainingArguments(
         output_dir=f"./results_fold{fold + 1}",
         num_train_epochs=6,
-        per_device_train_batch_size=32,  # RTX 6000 Ada: try 32/48/64, tune for OOM
+        per_device_train_batch_size=32,  # ALBERT-xxlarge can be memory-hungry; adjust as needed
         per_device_eval_batch_size=64,
         gradient_accumulation_steps=1,
-        learning_rate=2e-5,
+        learning_rate=1e-5,  # 1e-5 or 2e-5; ALBERT likes slightly lower LR
         weight_decay=0.01,
-        load_best_model_at_end=True,
         logging_dir=f"./logs_fold{fold + 1}",
         eval_strategy="epoch",
-        save_strategy="epoch",  # Must match eval_strategy if using load_best_model_at_end
-        save_total_limit=1,
+        save_strategy="no",
+        load_best_model_at_end=False,
         metric_for_best_model="eval_loss",
-        fp16=True,  # Always use on RTX 6000 Ada!
-        dataloader_num_workers=4,  # RTX 6000 Ada can go 4-8, but higher is not always faster
-        logging_steps=25,  # Print progress often
+        fp16=True,
+        dataloader_num_workers=8,
         seed=42 + fold,
         report_to="none"
     )
 
-    print(f"Starting Trainer for fold {fold+1}... Batch size: {training_args.per_device_train_batch_size}")
-    try:
-        trainer = Trainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_dataset,
-            eval_dataset=val_dataset,
-            data_collator=data_collator,
-            compute_metrics=compute_metrics,
-            callbacks=[EarlyStoppingCallback(early_stopping_patience=2, early_stopping_threshold=0.0)],
-        )
-        trainer.train()
-    except Exception as e:
-        print("Training error:", e)
-        raise
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        data_collator=data_collator,
+        compute_metrics=compute_metrics,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=2, early_stopping_threshold=0.0)],
+    )
+
+    trainer.train()
 
     val_logits = trainer.predict(val_dataset).predictions
     val_probs = torch.nn.functional.softmax(torch.tensor(val_logits), dim=-1).numpy()
     oof_preds[val_idx] = val_probs
 
+    # test only tokenize ONCE, not per fold!
     if fold == 0:
         test_encodings = preprocess(tokenizer, test)
         test_dataset = SpookyDataset(test_encodings)
@@ -132,13 +120,7 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train, train['label'])):
     test_probs = torch.nn.functional.softmax(torch.tensor(test_logits), dim=-1).numpy()
     test_logits_all[fold] = test_probs
 
-    # Cleanup to avoid disk bloat
-    import shutil
-    shutil.rmtree(f"./results_fold{fold + 1}", ignore_errors=True)
-    shutil.rmtree(f"./logs_fold{fold + 1}", ignore_errors=True)
-    torch.cuda.empty_cache()
-
-# ---- 5. Final Outputs ----
+# Average test predictions over folds
 test_preds = np.mean(test_logits_all, axis=0)
 eps = 1e-15
 test_preds = test_preds / test_preds.sum(axis=1, keepdims=True)
