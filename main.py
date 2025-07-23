@@ -1,141 +1,115 @@
-import os
 import pandas as pd
 import numpy as np
-from transformers import (AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments,
-                          DataCollatorWithPadding, EarlyStoppingCallback)
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import log_loss
 import torch
+from sklearn.model_selection import StratifiedKFold
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
 
-# HuggingFace cache
-os.environ['HF_HOME'] = '/workspace/huggingface_cache'
-os.environ['TRANSFORMERS_CACHE'] = '/workspace/huggingface_cache'
-os.environ['HF_DATASETS_CACHE'] = '/workspace/huggingface_cache'
-os.makedirs('/workspace/huggingface_cache', exist_ok=True)
+# Load the training data
+train_df = pd.read_csv("train.csv")
+# Map author labels to numeric IDs
+label_map = {'EAP': 0, 'HPL': 1, 'MWS': 2}
+train_df['label'] = train_df['author'].map(label_map)
 
-# 1. Data
-train = pd.read_csv('train.csv')
-test = pd.read_csv('test.csv')
-author2label = {a: i for i, a in enumerate(sorted(train['author'].unique()))}
-label2author = {i: a for a, i in author2label.items()}
-train['label'] = train['author'].map(author2label)
-
-MODEL_NAME = "albert-xxlarge-v2"
-MAX_LEN = 512  # reduce to 384 if OOM
-
+# Initialize tokenizer for DeBERTa-v3-large
+MODEL_NAME = "microsoft/deberta-v3-large"
+MAX_LEN = 512
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-def preprocess(tokenizer, df):
-    return tokenizer(
-        df["text"].tolist(),
-        truncation=True,
-        padding=False,       # dynamic padding
-        max_length=MAX_LEN,
-        return_tensors=None  # tensors in collator
-    )
 
-class SpookyDataset(torch.utils.data.Dataset):
-    def __init__(self, encodings, labels=None):
+# Utility: Tokenize a list of texts and optionally attach labels
+def tokenize_texts(texts, labels=None):
+    encodings = tokenizer(list(texts), truncation=True, padding=True, max_length=MAX_LEN)
+    if labels is not None:
+        encodings["labels"] = list(labels)
+    return encodings
+
+
+# Define a PyTorch Dataset to work with our encodings
+class TextDataset(torch.utils.data.Dataset):
+    def __init__(self, encodings):
         self.encodings = encodings
-        self.labels = labels
-    def __getitem__(self, idx):
-        item = {k: torch.tensor(v[idx]) for k, v in self.encodings.items()}
-        if self.labels is not None:
-            item["labels"] = torch.tensor(self.labels[idx])
-        return item
+
     def __len__(self):
         return len(self.encodings["input_ids"])
 
-def compute_metrics(eval_pred):
-    logits, labels = eval_pred
-    probs = torch.nn.functional.softmax(torch.tensor(logits), dim=-1).numpy()
-    return {"log_loss": log_loss(labels, probs)}
+    def __getitem__(self, idx):
+        item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
+        return item
 
-# 2. Data Collator (fast dynamic padding)
-data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=8)
 
-# 3. KFold
-NUM_FOLDS = 5
+# Set up 6-fold stratified cross-validation
+NUM_FOLDS = 6
 skf = StratifiedKFold(n_splits=NUM_FOLDS, shuffle=True, random_state=42)
-oof_preds = np.zeros((len(train), 3))
-test_preds = np.zeros((len(test), 3))
 
-for fold, (train_idx, val_idx) in enumerate(skf.split(train, train['label'])):
-    print(f"\n==== Fold {fold+1}/{NUM_FOLDS} ====")
-    train_fold = train.iloc[train_idx].reset_index(drop=True)
-    val_fold = train.iloc[val_idx].reset_index(drop=True)
+# Prepare test data encoding once (to use for each fold’s prediction)
+test_df = pd.read_csv("test.csv")
+test_enc = tokenizer(list(test_df['text']), truncation=True, padding=True, max_length=MAX_LEN)
+test_dataset = TextDataset(test_enc)
 
-    train_encodings = preprocess(tokenizer, train_fold)
-    val_encodings = preprocess(tokenizer, val_fold)
-
-    train_dataset = SpookyDataset(train_encodings, train_fold['label'].values)
-    val_dataset = SpookyDataset(val_encodings, val_fold['label'].values)
-
-    model = AutoModelForSequenceClassification.from_pretrained(
-        MODEL_NAME,
-        num_labels=3
-    )
-
+all_fold_probs = []  # to collect probability predictions from each fold
+for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, train_df['label']), start=1):
+    print(f"Training fold {fold}/{NUM_FOLDS}...")
+    # Split into training and validation sets for this fold
+    train_data = train_df.iloc[train_idx]
+    val_data = train_df.iloc[val_idx]
+    # Tokenize the text and labels
+    train_enc = tokenize_texts(train_data['text'], train_data['label'])
+    val_enc = tokenize_texts(val_data['text'], val_data['label'])
+    # Create Dataset objects for Trainer
+    train_dataset = TextDataset(train_enc)
+    val_dataset = TextDataset(val_enc)
+    # Load a fresh DeBERTa model for this fold
+    model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=3)
+    # Setup training hyperparameters (adjust batch size if you encounter OOM errors)
     training_args = TrainingArguments(
-        output_dir=f"./results_fold{fold + 1}",
-        num_train_epochs=6,
-        per_device_train_batch_size=16,  # ALBERT-xxlarge can be memory-hungry; adjust as needed
-        per_device_eval_batch_size=16,
-        gradient_accumulation_steps=2,
-        learning_rate=1e-5,  # 1e-5 or 2e-5; ALBERT likes slightly lower LR
+        output_dir=f"./deberta_results_fold{fold}",
+        num_train_epochs=4,  # 4 epochs (adjust based on validation performance)
+        per_device_train_batch_size=32,  # if OOM, try 16 and set grad_accumulation_steps=2
+        per_device_eval_batch_size=64,
+        gradient_accumulation_steps=1,
+        learning_rate=1e-5,  # lower LR for large models
         weight_decay=0.01,
-        logging_dir=f"./logs_fold{fold + 1}",
-        eval_strategy="epoch",
-        save_strategy="no",
-        load_best_model_at_end=False,
+        evaluation_strategy="epoch",  # evaluate on the validation set each epoch
+        save_strategy="no",  # no intermediate checkpoints (to save space)
+        load_best_model_at_end=False,  # not saving checkpoints, so set this False
         metric_for_best_model="eval_loss",
-        fp16=True,
-        dataloader_num_workers=8,
-        seed=42 + fold,
-        report_to="none"
+        label_smoothing_factor=0.1,  # helps reduce over-confident predictions
+        warmup_ratio=0.1,  # warmup 10% of steps for stability
+        fp16=True,  # use mixed precision for speed
+        seed=42 + fold,  # different seed each fold for diversity
+        dataloader_num_workers=4,
+        report_to="none"  # no HuggingFace logging (like Wandb) in this context
     )
-
+    # Initialize Trainer with our model and data
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        data_collator=data_collator,
-        compute_metrics=compute_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=2, early_stopping_threshold=0.0)],
+        eval_dataset=val_dataset
     )
-
+    # Train the model on this fold
     trainer.train()
+    # Evaluate on validation (optional: Trainer already evaluates each epoch due to eval_strategy="epoch")
+    # val_metrics = trainer.evaluate()  # you can print val_metrics if needed
 
-    val_logits = trainer.predict(val_dataset).predictions
-    val_probs = torch.nn.functional.softmax(torch.tensor(val_logits), dim=-1).numpy()
-    oof_preds[val_idx] = val_probs
+    # Predict on the test set with the current fold's model
+    predictions = trainer.predict(test_dataset)  # returns predictions, label_ids, metrics
+    logits = predictions.predictions  # model outputs (logits) for each test example
+    # Convert logits to probability distributions with softmax
+    probs = torch.nn.functional.softmax(torch.tensor(logits), dim=1).numpy()
+    all_fold_probs.append(probs)
+    print(f"Fold {fold} done.")
 
-    # test only tokenize ONCE, not per fold!
-    if fold == 0:
-        test_encodings = preprocess(tokenizer, test)
-        test_dataset = SpookyDataset(test_encodings)
-        test_logits_all = np.zeros((NUM_FOLDS, len(test), 3))
-    test_logits = trainer.predict(test_dataset).predictions
-    test_probs = torch.nn.functional.softmax(torch.tensor(test_logits), dim=-1).numpy()
-    test_logits_all[fold] = test_probs
+# Ensemble: average the probabilities from all folds
+avg_probs = np.mean(np.array(all_fold_probs), axis=0)  # shape: [num_test_samples, 3]
 
-# Average test predictions over folds
-test_preds = np.mean(test_logits_all, axis=0)
-eps = 1e-15
-test_preds = test_preds / test_preds.sum(axis=1, keepdims=True)
-test_preds = np.clip(test_preds, eps, 1 - eps)
-oof_logloss = log_loss(train['label'].values, oof_preds)
-print(f"\n==== OOF LOGLOSS (CV estimate): {oof_logloss:.5f} ====")
+# Determine final predicted author for each test sample
+pred_label_indices = avg_probs.argmax(axis=1)
+# Map label indices back to author names
+inv_label_map = {v: k for k, v in label_map.items()}
+pred_authors = [inv_label_map[idx] for idx in pred_label_indices]
 
-# Submission
-sub = pd.DataFrame(test_preds, columns=[label2author[i] for i in range(3)])
-sub.insert(0, "id", test['id'])
-sub.to_csv("submission.csv", index=False, float_format="%.12f")
-print("submission.csv written.")
-
-oof_df = pd.DataFrame(oof_preds, columns=[label2author[i] for i in range(3)])
-oof_df["id"] = train["id"]
-oof_df["true_label"] = train["author"]
-oof_df.to_csv("oof_predictions.csv", index=False)
-print("oof_predictions.csv written.")
+# Create submission DataFrame
+submission = pd.DataFrame({'id': test_df['id'], 'author': pred_authors})
+submission.to_csv("submission.csv", index=False)
+print("Ensemble submission saved to submission.csv")
