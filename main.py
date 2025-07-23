@@ -89,7 +89,7 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, train_df['label'
         gradient_accumulation_steps=1,
         learning_rate=1e-5,
         weight_decay=0.01,
-        eval_strategy="epoch",
+        evaluation_strategy="epoch",
         save_strategy="no",
         load_best_model_at_end=False,
         metric_for_best_model="eval_loss",
