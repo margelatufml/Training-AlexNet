@@ -84,10 +84,10 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train, train['label'])):
         gradient_accumulation_steps=1,
         learning_rate=1e-5,  # 1e-5 or 2e-5; ALBERT likes slightly lower LR
         weight_decay=0.01,
+        load_best_model_at_end=True,
         logging_dir=f"./logs_fold{fold + 1}",
         eval_strategy="epoch",
         save_strategy="no",
-        load_best_model_at_end=False,
         metric_for_best_model="eval_loss",
         fp16=True,
         dataloader_num_workers=8,
@@ -102,7 +102,7 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train, train['label'])):
         eval_dataset=val_dataset,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=2, early_stopping_threshold=0.0,load_best_model_at_end=True)],
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=2, early_stopping_threshold=0.0)],
     )
 
     trainer.train()
