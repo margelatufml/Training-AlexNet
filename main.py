@@ -102,7 +102,7 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train, train['label'])):
         eval_dataset=val_dataset,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=2, early_stopping_threshold=0.0)],
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=2, early_stopping_threshold=0.0,load_best_model_at_end=True)],
     )
 
     trainer.train()
