@@ -79,9 +79,9 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train, train['label'])):
     training_args = TrainingArguments(
         output_dir=f"./results_fold{fold + 1}",
         num_train_epochs=6,
-        per_device_train_batch_size=32,  # ALBERT-xxlarge can be memory-hungry; adjust as needed
-        per_device_eval_batch_size=64,
-        gradient_accumulation_steps=1,
+        per_device_train_batch_size=16,  # ALBERT-xxlarge can be memory-hungry; adjust as needed
+        per_device_eval_batch_size=16,
+        gradient_accumulation_steps=2,
         learning_rate=1e-5,  # 1e-5 or 2e-5; ALBERT likes slightly lower LR
         weight_decay=0.01,
         logging_dir=f"./logs_fold{fold + 1}",
